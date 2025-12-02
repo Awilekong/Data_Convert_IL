@@ -22,8 +22,7 @@ import numpy as np
 import torch
 import tqdm
 from scipy.spatial.transform import Rotation as R
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import HF_LEROBOT_HOME
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 # 线程控制，避免过度并行
 os.environ.setdefault("OPENCV_NUM_THREADS", "1")
@@ -77,16 +76,16 @@ def quaternion_to_rotation_vector(quaternions: np.ndarray) -> np.ndarray:
 class Config:
     """全局配置"""
     # 数据路径
-    data_root: Path = Path("/home/megvii/ws_zpw/data/2025_11_18")
+    data_root: Path = Path("/home/zpw/ws_zpw/vla/data/2025_11_18")
     task_folder: str = "peg_in_hole1"
     
     # 输出配置
     repo_id: str = "franka/peg_in_hole"
-    output_dir: Path = Path.home() / "ws_zpw" / "data" / "lerobot_data" # 数据集保存目录
+    output_dir: Path = Path.home() / "ws_zpw" / "vla" / "data" / "lerobot_data" # 数据集保存目录
     target_size: Tuple[int, int] = (224, 224)  # (H, W)
     
     # 动作空间配置
-    action_space: ActionSpace = ActionSpace.JOINT_POSITION_DELTA
+    action_space: ActionSpace = ActionSpace.EE_POSE_DELTA
     
     # 数据处理
     stride: int = 1  # 采样间隔
@@ -97,7 +96,7 @@ class Config:
     min_frames_per_episode: int = 10  # 每个 episode 最少保留的帧数
     
     # None 表示转换所有，否则转换前n个s
-    max_episodes: Optional[int] = 1
+    max_episodes: Optional[int] = None
     
     # 相机配置
     camera_names: List[str] = None  # None表示自动检测
@@ -467,13 +466,13 @@ class LeRobotConverter:
             },
         }
         
-        # 添加相机特征
-        C, H, W = 3, self.config.target_size[0], self.config.target_size[1]
+        # 添加相机特征 - lerobot 0.1.0 使用 (H, W, C) 格式
+        H, W, C = self.config.target_size[0], self.config.target_size[1], 3
         for cam_name in self.config.camera_names:
             features[f"observation.images.{cam_name}"] = {
                 "dtype": "image",
-                "shape": (C, H, W),
-                "names": ["channels", "height", "width"],
+                "shape": (H, W, C),
+                "names": ["height", "width", "channels"],
             }
         
         # 清理旧数据
@@ -489,11 +488,8 @@ class LeRobotConverter:
             robot_type="franka",
             features=features,
             use_videos=False,
-            tolerance_s=1e-4,
-            image_writer_processes=8,  # 增加到8个进程
-            image_writer_threads=8,    # 增加到8个线程
-            video_backend=None,
-            root=str(self.config.output_dir),  # 指定保存路径
+            image_writer_threads=8,
+            image_writer_processes=8,
         )
         
         return self.dataset
@@ -515,13 +511,7 @@ class LeRobotConverter:
         for cam_data in processed_data['video_frames'].values():
             T = min(T, len(cam_data))
         
-        # 预先转换所有图像为 CHW 格式（向量化操作）
-        images_chw = {}
-        for cam_name in self.config.camera_names:
-            # (T, H, W, 3) -> (T, 3, H, W)
-            images_chw[cam_name] = np.transpose(processed_data['video_frames'][cam_name][:T], (0, 3, 1, 2))
-        
-        # 批量添加帧
+        # 批量添加帧 - lerobot 0.1.0 使用 (H, W, C) 图像格式
         for t in range(T):
             frame = {
                 "observation.state": torch.from_numpy(state[t]),
@@ -529,9 +519,9 @@ class LeRobotConverter:
                 "task": task_str,
             }
             
-            # 添加预处理好的图像
+            # 添加图像 - 直接使用 (H, W, C) 格式
             for cam_name in self.config.camera_names:
-                frame[f"observation.images.{cam_name}"] = images_chw[cam_name][t]
+                frame[f"observation.images.{cam_name}"] = processed_data['video_frames'][cam_name][t]
             
             self.dataset.add_frame(frame)
         
@@ -540,8 +530,8 @@ class LeRobotConverter:
     def finalize(self):
         """完成数据集"""
         if self.dataset:
-            # LeRobotDataset 没有 consolidate 方法，数据已经在 save_episode 时保存
-            print(f"Dataset finalized with {len(self.dataset)} frames across {self.dataset.num_episodes} episodes")
+            # lerobot 0.1.0 数据已经在 save_episode 时保存，不需要额外步骤
+            print(f"Dataset finalized with {self.dataset.num_episodes} episodes")
     
     def _build_state(self, processed_data: Dict) -> np.ndarray:
         """构建 state: state_data + gripper
