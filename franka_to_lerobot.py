@@ -75,13 +75,12 @@ def quaternion_to_rotation_vector(quaternions: np.ndarray) -> np.ndarray:
 @dataclass
 class Config:
     """全局配置"""
-    # 数据路径
-    data_root: Path = Path("/home/zpw/ws_zpw/vla/data/2025_11_18")
-    task_folder: str = "peg_in_hole1"
+    # 数据路径列表 (支持多个源目录合并)
+    source_paths: List[Path] = None
     
     # 输出配置
-    repo_id: str = "franka/peg_in_hole"
-    output_dir: Path = Path.home() / "ws_zpw" / "vla" / "data" / "lerobot_data" # 数据集保存目录
+    repo_id: str = "franka/peg_in_hole_merged"
+    output_dir: Path = Path("/home/dataset-local/data/megvii_post") # 数据集保存目录
     target_size: Tuple[int, int] = (224, 224)  # (H, W)
     
     # 动作空间配置
@@ -95,6 +94,13 @@ class Config:
     frame_filter_threshold: float = 1e-10  # 帧过滤阈值：state 变化幅度 (默认只过滤静止帧)
     min_frames_per_episode: int = 10  # 每个 episode 最少保留的帧数
     
+    # 夹爪配置
+    enable_gripper_binarization: bool = True  # 是否启用夹爪二值化
+    gripper_binarization_threshold: float = 0.075 # 夹爪二值化阈值
+
+    # 提示词配置
+    prompt: Optional[str] = None  # 如果指定，将覆盖 meta.json 中的 prompt
+
     # None 表示转换所有，否则转换前n个s
     max_episodes: Optional[int] = None
     
@@ -102,6 +108,13 @@ class Config:
     camera_names: List[str] = None  # None表示自动检测
     
     def __post_init__(self):
+        if self.source_paths is None:
+            # 默认路径列表
+            self.source_paths = [
+                Path("/home/dataset-local/data/megvii/01_09_peg/peg_in_hole1"),
+                Path("/home/dataset-local/data/megvii/2026_01_12/peg_in_hole1/peg_add")
+            ]
+        
         if self.camera_names is None:
             self.camera_names = ["main_realsense_rgb", "side_realsense_rgb", "handeye_realsense_rgb"]
         
@@ -118,32 +131,38 @@ class FrankaDataLoader:
     
     def __init__(self, config: Config):
         self.config = config
-        self.data_root = config.data_root / config.task_folder
         
-    def get_all_episodes(self) -> List[str]:
-        """获取所有 episode 时间文件夹"""
-        if not self.data_root.exists():
-            raise ValueError(f"Task folder not found: {self.data_root}")
+    def get_all_episodes(self) -> List[Path]:
+        """获取所有 episode 的完整路径"""
+        all_episodes = []
         
-        episodes = sorted([d.name for d in self.data_root.iterdir() if d.is_dir()])
+        for source_path in self.config.source_paths:
+            if not source_path.exists():
+                print(f"Warning: Source path not found: {source_path}")
+                continue
+                
+            # 获取该源下的所有 episode 目录
+            episodes = sorted([d for d in source_path.iterdir() if d.is_dir()])
+            print(f"Found {len(episodes)} episodes in {source_path}")
+            all_episodes.extend(episodes)
         
         if self.config.max_episodes:
-            episodes = episodes[:self.config.max_episodes]
+            all_episodes = all_episodes[:self.config.max_episodes]
             
-        return episodes
+        return all_episodes
     
-    def load_meta(self, episode: str) -> Dict:
+    def load_meta(self, episode_path: Path) -> Dict:
         """加载 meta.json"""
-        meta_path = self.data_root / episode / "v1" / "meta.json"
+        meta_path = episode_path / "v1" / "meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"meta.json not found: {meta_path}")
         
         with open(meta_path, 'r', encoding='utf-8') as f:
             return json.load(f)
     
-    def load_robot_data(self, episode: str) -> Dict[str, np.ndarray]:
+    def load_robot_data(self, episode_path: Path) -> Dict[str, np.ndarray]:
         """从 jsonl 加载机器人数据"""
-        jsonl_path = self.data_root / episode / "v1" / "data" / "Franka_4_arms_arm.jsonl"
+        jsonl_path = episode_path / "v1" / "data" / "Franka_4_arms_arm.jsonl"
         
         if not jsonl_path.exists():
             raise FileNotFoundError(f"Robot data not found: {jsonl_path}")
@@ -166,9 +185,9 @@ class FrankaDataLoader:
             'gripper_width': gripper_width,  # (T,) - 夹爪宽度
         }
     
-    def load_video_frames(self, episode: str, frame_indices: List[int]) -> Dict[str, np.ndarray]:
+    def load_video_frames(self, episode_path: Path, frame_indices: List[int]) -> Dict[str, np.ndarray]:
         """加载指定帧的图像（并行加载多个相机）"""
-        video_dir = self.data_root / episode / "v1" / "videos"
+        video_dir = episode_path / "v1" / "videos"
         
         def load_camera(cam_name):
             video_path = video_dir / f"{cam_name}.mp4"
@@ -396,20 +415,11 @@ class DataProcessor:
         return np.array(deltas, dtype=np.float32)
     
     def _binarize_gripper(self, gripper: np.ndarray) -> np.ndarray:
-        """夹爪二值化 - 基于数据分析确定阈值
-        
-        数据分析结果 (基于 50 个 episodes, 49587 个数据点):
-        - 双峰分布:
-          * 合 (closed): 19-24mm (57.3% 的数据)
-          * 开 (open): 70-85mm (40.6% 的数据)
-          * 中间过渡: 25-70mm (仅 2.1% 的数据)
-        
-        - 最常见的值:
-          * 85.00mm: 39.3% (完全开启)
-          * 20.22mm: 31.5% (抓紧物体)
-          * 19.85mm: 23.8% (最紧)
-        """
-        threshold = 0.025  # 25mm
+        """夹爪处理"""
+        if not self.config.enable_gripper_binarization:
+            return gripper.astype(np.float32)
+            
+        threshold = self.config.gripper_binarization_threshold
         return np.where(gripper < threshold, 0.0, 1.0).astype(np.float32)
     
     def _resize_frames(self, frames: np.ndarray) -> np.ndarray:
@@ -490,6 +500,7 @@ class LeRobotConverter:
             use_videos=False,
             image_writer_threads=8,
             image_writer_processes=8,
+            root=out_root,
         )
         
         return self.dataset
@@ -568,7 +579,13 @@ class LeRobotConverter:
         """提取任务描述字符串"""
         task_meta = meta.get("task_meta", {})
         task_name = task_meta.get("task_name", "unknown")
-        prompt = task_meta.get("prompt", "")
+        
+        # 优先使用配置中的 prompt
+        if self.config.prompt is not None:
+            prompt = self.config.prompt
+        else:
+            prompt = task_meta.get("prompt", "")
+            
         robot_model = meta.get("robot_meta", {}).get("robots", [{}])[0].get("robot_model", "")
         
         return f"{task_name} | {prompt} | robot={robot_model}".strip()
@@ -578,8 +595,45 @@ class LeRobotConverter:
 
 def main():
     """主函数"""
+    import argparse
+    parser = argparse.ArgumentParser(description="Franka to LeRobot Converter")
+    parser.add_argument("--prompt", type=str, default=None, help="Override prompt for all episodes")
+    parser.add_argument("--input", type=Path, nargs='+', help="Input directories")
+    parser.add_argument("--output", type=Path, default=Path("/home/dataset-local/data/megvii_post"), help="Output root directory")
+    parser.add_argument("--repo-id", type=str, default="franka/custom_dataset", help="HuggingFace Repo ID")
+    parser.add_argument("--no-filter", action="store_true", help="Disable frame filtering")
+    parser.add_argument("--filter-threshold", type=float, default=1e-10, help="Frame filter threshold")
+    parser.add_argument("--stride", type=int, default=1, help="Sampling stride")
+    parser.add_argument("--no-binarize-gripper", action="store_false", dest="binarize_gripper", help="Disable gripper binarization")
+    parser.add_argument("--gripper-threshold", type=float, default=0.075, help="Threshold for gripper binarization (default: 0.075)")
+    parser.set_defaults(binarize_gripper=True)
+    
+    args = parser.parse_args()
+
     config = Config()
     
+    if args.prompt is not None:
+        config.prompt = args.prompt
+    
+    if args.input:
+        config.source_paths = args.input
+        
+    if args.output:
+        config.output_dir = args.output
+        
+    if args.repo_id:
+        config.repo_id = args.repo_id
+        
+    if args.no_filter:
+        config.enable_frame_filtering = False
+        
+    if args.filter_threshold:
+        config.frame_filter_threshold = args.filter_threshold
+
+    config.stride = args.stride
+    config.enable_gripper_binarization = args.binarize_gripper
+    config.gripper_binarization_threshold = args.gripper_threshold
+
     # 示例: 如何修改动作空间
     # config.action_space = ActionSpace.JOINT_POSITION_GLOBAL
     # config.action_space = ActionSpace.EE_POSE_GLOBAL
@@ -594,40 +648,44 @@ def main():
     converter = LeRobotConverter(config)
     
     # 获取所有 episodes
-    episodes = loader.get_all_episodes()
-    print(f"Found {len(episodes)} episodes")
+    episode_paths = loader.get_all_episodes()
+    print(f"Total episodes found: {len(episode_paths)}")
     
-    if not episodes:
+    if not episode_paths:
         raise ValueError("No episodes found")
     
     # 处理第一个 episode 以创建数据集骨架
-    print(f"Processing first episode: {episodes[0]}")
-    first_meta = loader.load_meta(episodes[0])
-    first_robot_data = loader.load_robot_data(episodes[0])
+    print(f"Processing first episode: {episode_paths[0]}")
+    first_meta = loader.load_meta(episode_paths[0])
+    first_robot_data = loader.load_robot_data(episode_paths[0])
     
     # 计算帧索引
     T_raw = len(first_robot_data['timestamps'])
     frame_indices = list(range(0, T_raw - config.stride, config.stride))
     
-    first_video_frames = loader.load_video_frames(episodes[0], frame_indices)
+    first_video_frames = loader.load_video_frames(episode_paths[0], frame_indices)
     first_processed = processor.process_episode(first_robot_data, first_video_frames)
     
     # 创建数据集
     converter.create_dataset(first_processed, first_meta)
     
     # 转换所有 episodes
-    for episode in tqdm.tqdm(episodes, desc="Converting episodes"):
-        meta = loader.load_meta(episode)
-        robot_data = loader.load_robot_data(episode)
-        
-        # 计算帧索引
-        T_raw = len(robot_data['timestamps'])
-        frame_indices = list(range(0, T_raw - config.stride, config.stride))
-        
-        video_frames = loader.load_video_frames(episode, frame_indices)
-        processed_data = processor.process_episode(robot_data, video_frames)
-        
-        converter.add_episode(processed_data, meta)
+    for episode_path in tqdm.tqdm(episode_paths, desc="Converting episodes"):
+        try:
+            meta = loader.load_meta(episode_path)
+            robot_data = loader.load_robot_data(episode_path)
+            
+            # 计算帧索引
+            T_raw = len(robot_data['timestamps'])
+            frame_indices = list(range(0, T_raw - config.stride, config.stride))
+            
+            video_frames = loader.load_video_frames(episode_path, frame_indices)
+            processed_data = processor.process_episode(robot_data, video_frames)
+            
+            converter.add_episode(processed_data, meta)
+        except Exception as e:
+            print(f"Error processing episode {episode_path}: {e}")
+            continue
     
     # 完成
     converter.finalize()
